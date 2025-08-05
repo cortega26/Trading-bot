@@ -1,0 +1,39 @@
+# Core Dependencies
+pandas>=1.5.0
+numpy>=1.21.0
+yfinance>=0.2.12
+pyyaml>=6.0
+
+# Machine Learning
+scikit-learn>=1.1.0
+xgboost>=1.6.0
+
+# Technical Analysis
+TA-Lib>=0.4.25
+
+# Data Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.10.0
+
+# Database
+sqlite3  # Built into Python
+
+# Scheduling and Threading
+APScheduler>=3.9.0
+
+# Email Notifications
+secure-smtplib>=0.1.1
+
+# Utilities
+python-dateutil>=2.8.0
+pytz>=2022.1
+
+# Optional: Advanced ML (uncomment if needed)
+# tensorflow>=2.9.0
+# torch>=1.12.0
+
+# Development Dependencies (optional)
+pytest>=7.0.0
+jupyter>=1.0.0
+notebook>=6.4.0

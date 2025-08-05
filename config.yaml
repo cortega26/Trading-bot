@@ -1,0 +1,54 @@
+# Trading Bot Configuration File
+
+# Trading Strategy Parameters
+trading:
+  max_positions: 5              # Maximum number of concurrent positions
+  max_position_size: 0.15       # Maximum 15% of portfolio per position
+  stop_loss_pct: 0.05           # 5% stop loss
+  take_profit_pct: 0.20         # 20% take profit target
+  risk_free_rate: 0.02          # 2% risk-free rate for calculations
+  lookback_days: 252            # Days of historical data to use
+  min_confidence: 0.70          # Minimum confidence threshold for trades
+
+# Data Configuration
+data:
+  symbols:                      # Stocks to monitor and trade
+    - AAPL                      # Apple Inc.
+    - GOOGL                     # Alphabet Inc.
+    - MSFT                      # Microsoft Corporation
+    - TSLA                      # Tesla Inc.
+    - NVDA                      # NVIDIA Corporation
+    - AMZN                      # Amazon.com Inc.
+    - META                      # Meta Platforms Inc.
+    - NFLX                      # Netflix Inc.
+  update_frequency: 300         # Update every 5 minutes (300 seconds)
+  data_source: yahoo            # Data source (currently only yahoo supported)
+  
+# Alert and Notification Settings
+alerts:
+  email_enabled: false          # Enable/disable email alerts
+  email_smtp: smtp.gmail.com    # SMTP server
+  email_port: 587               # SMTP port
+  email_user: ""                # Your email address
+  email_password: ""            # App password (not your regular password)
+  email_recipients:             # List of email addresses to receive alerts
+    - "carlosortega77@gmail.com"
+
+# Machine Learning Configuration
+ml:
+  model_type: random_forest     # Options: random_forest, gradient_boosting
+  retrain_frequency: 7          # Retrain model every N days
+  feature_window: 30            # Number of days for feature calculation
+  prediction_horizon: 5         # Predict N days ahead
+  
+# Risk Management
+risk:
+  max_portfolio_risk: 0.02      # Maximum 2% portfolio risk per trade
+  max_correlation: 0.7          # Maximum correlation between positions
+  volatility_lookback: 20       # Days to calculate volatility
+  
+# Backtesting Parameters
+backtest:
+  initial_capital: 100000       # Starting capital for backtests
+  commission: 0.001             # 0.1% commission per trade
+  slippage: 0.0005              # 0.05% slippage assumption
