@@ -1,8 +1,7 @@
 # trading_bot.py
 """
-Advanced Algorithmic Trading Bot
-Author: Claude Assistant
-Version: 1.0
+Advanced Algorithmic Trading Bot - FIXED VERSION
+Version: 1.1
 
 IMPORTANT DISCLAIMER:
 This software is for educational and research purposes only. Trading involves 
@@ -17,13 +16,15 @@ import numpy as np
 import logging
 import json
 import yaml
+import joblib
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 import warnings
 import smtplib
-from email.mime.text import MimeText
-from email.mime.multipart import MimeMultipart
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import sqlite3
 import threading
 import time
@@ -33,8 +34,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, classification_report
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
-
+from contextlib import contextmanager
+from getpass import getpass
 
 # Configure logging
 logging.basicConfig(
@@ -79,17 +80,34 @@ class Position:
 
 
 class ConfigManager:
-    """Configuration management for the trading bot"""
+    """Configuration management for the trading bot with security improvements"""
 
     def __init__(self, config_file: str = 'config.yaml'):
         self.config_file = config_file
         self.config = self.load_config()
+        self.validate_config()
 
     def load_config(self) -> Dict[str, Any]:
-        """Load configuration from YAML file"""
+        """Load configuration from YAML file with environment variable support"""
         try:
             with open(self.config_file, 'r') as file:
-                return yaml.safe_load(file)
+                config = yaml.safe_load(file)
+
+            # Override sensitive data from environment variables
+            if 'alerts' in config:
+                config['alerts']['email_password'] = os.environ.get(
+                    'TRADING_BOT_EMAIL_PASSWORD',
+                    config['alerts'].get('email_password', '')
+                )
+
+                # Prompt for password if not set and email is enabled
+                if config['alerts'].get('email_enabled') and not config['alerts']['email_password']:
+                    config['alerts']['email_password'] = getpass(
+                        "Enter email password (or set TRADING_BOT_EMAIL_PASSWORD env var): "
+                    )
+
+            return config
+
         except FileNotFoundError:
             logger.warning(
                 f"Config file {self.config_file} not found. Using defaults.")
@@ -128,17 +146,82 @@ class ConfigManager:
             }
         }
 
+    def validate_config(self) -> bool:
+        """Validate configuration with detailed error messages"""
+        errors = []
+
+        # Validate trading section
+        if 'trading' not in self.config:
+            errors.append("Missing 'trading' section in config")
+        else:
+            trading = self.config['trading']
+            if trading.get('max_position_size', 0) > 1:
+                errors.append("max_position_size cannot exceed 1.0 (100%)")
+            if not 0 <= trading.get('min_confidence', 0) <= 1:
+                errors.append("min_confidence must be between 0 and 1")
+
+        # Validate data section
+        if 'data' not in self.config:
+            errors.append("Missing 'data' section in config")
+        else:
+            data = self.config['data']
+            if not data.get('symbols'):
+                errors.append("No symbols defined in config")
+            else:
+                for symbol in data['symbols']:
+                    if not self.validate_symbol(symbol):
+                        errors.append(f"Invalid symbol format: {symbol}")
+
+        if errors:
+            for error in errors:
+                logger.error(f"Config validation error: {error}")
+            raise ValueError(
+                f"Configuration validation failed: {'; '.join(errors)}")
+
+        return True
+
+    @staticmethod
+    def validate_symbol(symbol: str) -> bool:
+        """Validate stock symbol format"""
+        if not symbol or not isinstance(symbol, str):
+            return False
+
+        # Basic validation: 1-5 uppercase letters
+        import re
+        return bool(re.match(r'^[A-Z]{1,5}$', symbol.upper()))
+
 
 class DataCollector:
-    """Handles data collection from various sources"""
+    """Thread-safe data collection from various sources"""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.cache = {}
         self.last_update = {}
+        self._lock = threading.RLock()  # Reentrant lock for thread safety
+
+    @contextmanager
+    def _thread_safe_cache(self):
+        """Context manager for thread-safe cache access"""
+        self._lock.acquire()
+        try:
+            yield self.cache
+        finally:
+            self._lock.release()
 
     def get_stock_data(self, symbol: str, period: str = '1y') -> pd.DataFrame:
-        """Get stock data from Yahoo Finance"""
+        """Get stock data with thread-safe caching"""
+        cache_key = f"{symbol}_{period}"
+
+        # Check cache with thread safety
+        with self._thread_safe_cache() as cache:
+            if cache_key in cache:
+                cached_data, last_update = cache[cache_key], self.last_update.get(
+                    cache_key)
+                if last_update and (datetime.now() - last_update).seconds < 300:
+                    logger.debug(f"Using cached data for {symbol}")
+                    return cached_data
+
         try:
             ticker = yf.Ticker(symbol)
             data = ticker.history(period=period)
@@ -150,6 +233,11 @@ class DataCollector:
             # Add additional columns
             data['Symbol'] = symbol
             data['Returns'] = data['Close'].pct_change()
+
+            # Update cache with thread safety
+            with self._thread_safe_cache() as cache:
+                cache[cache_key] = data
+                self.last_update[cache_key] = datetime.now()
 
             logger.info(f"Retrieved {len(data)} records for {symbol}")
             return data
@@ -200,7 +288,7 @@ class DataCollector:
 
 
 class TechnicalIndicators:
-    """Calculate various technical indicators"""
+    """Calculate various technical indicators with error handling"""
 
     @staticmethod
     def sma(data: pd.Series, window: int) -> pd.Series:
@@ -210,16 +298,24 @@ class TechnicalIndicators:
     @staticmethod
     def ema(data: pd.Series, window: int) -> pd.Series:
         """Exponential Moving Average"""
-        return data.ewm(span=window).mean()
+        return data.ewm(span=window, adjust=False).mean()
 
     @staticmethod
     def rsi(data: pd.Series, window: int = 14) -> pd.Series:
-        """Relative Strength Index"""
+        """Relative Strength Index with division by zero protection"""
         delta = data.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        gain = delta.where(delta > 0, 0).rolling(window=window).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=window).mean()
+
+        # Prevent division by zero
+        rs = gain / loss.where(loss != 0, np.inf)
+        rsi = 100 - (100 / (1 + rs))
+
+        # Handle edge cases
+        rsi = rsi.fillna(50)  # Neutral RSI when undefined
+        rsi = rsi.replace([np.inf, -np.inf], [100, 0])  # Extreme values
+
+        return rsi
 
     @staticmethod
     def macd(data: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
@@ -245,7 +341,11 @@ class TechnicalIndicators:
         """Stochastic Oscillator"""
         lowest_low = low.rolling(window=k_window).min()
         highest_high = high.rolling(window=k_window).max()
-        k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+
+        # Prevent division by zero
+        denominator = highest_high - lowest_low
+        k_percent = 100 * ((close - lowest_low) /
+                           denominator.where(denominator != 0, 1))
         d_percent = k_percent.rolling(window=d_window).mean()
         return k_percent, d_percent
 
@@ -279,8 +379,9 @@ class FeatureEngineering:
                 close, window)
             self.features[f'EMA_{window}'] = TechnicalIndicators.ema(
                 close, window)
+            sma = self.features[f'SMA_{window}']
             self.features[f'Price_to_SMA_{window}'] = close / \
-                self.features[f'SMA_{window}']
+                sma.where(sma != 0, 1)
 
         # Technical indicators
         self.features['RSI'] = TechnicalIndicators.rsi(close)
@@ -295,12 +396,17 @@ class FeatureEngineering:
         self.features['BB_Upper'] = upper_bb
         self.features['BB_Middle'] = middle_bb
         self.features['BB_Lower'] = lower_bb
+
+        # Safe BB position calculation
+        bb_range = upper_bb - lower_bb
         self.features['BB_Position'] = (
-            close - lower_bb) / (upper_bb - lower_bb)
+            close - lower_bb) / bb_range.where(bb_range != 0, 1)
 
         # Volume features
         self.features['Volume_SMA_20'] = TechnicalIndicators.sma(volume, 20)
-        self.features['Volume_Ratio'] = volume / self.features['Volume_SMA_20']
+        volume_sma = self.features['Volume_SMA_20']
+        self.features['Volume_Ratio'] = volume / \
+            volume_sma.where(volume_sma != 0, 1)
 
         # Price features
         self.features['Price_Change'] = close.pct_change()
@@ -322,8 +428,9 @@ class FeatureEngineering:
 
         # Momentum
         for period in [5, 10, 20]:
+            close_shifted = close.shift(period)
             self.features[f'Momentum_{period}'] = close / \
-                close.shift(period) - 1
+                close_shifted.where(close_shifted != 0, 1) - 1
 
         return self.features
 
@@ -343,7 +450,7 @@ class FeatureEngineering:
 
 
 class MLPredictor:
-    """Machine learning predictor for trading signals"""
+    """Machine learning predictor with model persistence"""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -351,6 +458,7 @@ class MLPredictor:
         self.scaler = StandardScaler()
         self.is_trained = False
         self.feature_importance = None
+        self.feature_names = None
 
     def prepare_data(self, data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.Series]:
         """Prepare data for machine learning"""
@@ -403,6 +511,9 @@ class MLPredictor:
             logger.warning("Insufficient data for reliable training")
             return
 
+        # Store feature names
+        self.feature_names = X.columns.tolist()
+
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
@@ -452,14 +563,25 @@ class MLPredictor:
         self.is_trained = True
 
     def predict(self, features: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Make predictions using the trained model"""
+        """Make predictions using the trained model with compatibility fixes"""
         if not self.is_trained or self.model is None:
             logger.error("Model not trained yet")
             return np.array([]), np.array([])
 
+        # Get feature names from training
+        if self.feature_names:
+            feature_names = self.feature_names
+        else:
+            # Fallback for compatibility
+            try:
+                # For sklearn >= 1.0
+                feature_names = self.scaler.feature_names_in_
+            except AttributeError:
+                # For older sklearn versions
+                feature_names = features.columns
+
         # Ensure features have the same columns as training data
-        X = features.reindex(
-            columns=self.scaler.feature_names_in_, fill_value=0)
+        X = features.reindex(columns=feature_names, fill_value=0)
         X_scaled = self.scaler.transform(X)
 
         predictions = self.model.predict(X_scaled)
@@ -467,15 +589,66 @@ class MLPredictor:
 
         return predictions, probabilities
 
+    def save_model(self, filepath: str = 'trading_model.pkl') -> None:
+        """Save trained model to disk"""
+        if not self.is_trained:
+            logger.error("Cannot save untrained model")
+            return
+
+        model_data = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'feature_importance': self.feature_importance,
+            'feature_names': self.feature_names,
+            'training_date': datetime.now(),
+            'config': self.config
+        }
+
+        try:
+            joblib.dump(model_data, filepath)
+            logger.info(f"Model saved to {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save model: {str(e)}")
+
+    def load_model(self, filepath: str = 'trading_model.pkl') -> bool:
+        """Load trained model from disk"""
+        try:
+            if not os.path.exists(filepath):
+                logger.warning(f"Model file {filepath} not found")
+                return False
+
+            model_data = joblib.load(filepath)
+            self.model = model_data['model']
+            self.scaler = model_data['scaler']
+            self.feature_importance = model_data.get('feature_importance')
+            self.feature_names = model_data.get('feature_names')
+            self.is_trained = True
+
+            training_date = model_data.get('training_date')
+            if training_date:
+                days_old = (datetime.now() - training_date).days
+                logger.info(f"Loaded model trained {days_old} days ago")
+
+                if days_old > 30:
+                    logger.warning(
+                        "Model is over 30 days old, consider retraining")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to load model: {str(e)}")
+            return False
+
 
 class RiskManager:
-    """Risk management system"""
+    """Risk management system with thread safety"""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.positions = {}
         self.portfolio_value = 100000  # Starting portfolio value
         self.max_portfolio_risk = 0.02  # 2% max portfolio risk
+        self._lock = threading.RLock()  # Thread safety
 
     def calculate_position_size(self, signal: TradingSignal, portfolio_value: float) -> float:
         """Calculate appropriate position size based on risk management"""
@@ -485,58 +658,61 @@ class RiskManager:
         if signal.stop_loss and signal.current_price:
             # Risk-based position sizing
             risk_per_share = abs(signal.current_price - signal.stop_loss)
-            max_risk = portfolio_value * self.max_portfolio_risk
-            shares_by_risk = max_risk / risk_per_share
-            position_value_by_risk = shares_by_risk * signal.current_price
+            if risk_per_share > 0:
+                max_risk = portfolio_value * self.max_portfolio_risk
+                shares_by_risk = max_risk / risk_per_share
+                position_value_by_risk = shares_by_risk * signal.current_price
 
-            # Use the smaller of the two position sizes
-            max_position_value = min(
-                max_position_value, position_value_by_risk)
+                # Use the smaller of the two position sizes
+                max_position_value = min(
+                    max_position_value, position_value_by_risk)
 
-        return max_position_value / signal.current_price
+        return max_position_value / signal.current_price if signal.current_price > 0 else 0
 
     def check_risk_limits(self, signal: TradingSignal) -> bool:
         """Check if trade meets risk management criteria"""
-        # Check confidence threshold
-        if signal.confidence < self.config['trading']['min_confidence']:
-            logger.info(
-                f"Signal for {signal.symbol} below confidence threshold")
-            return False
+        with self._lock:
+            # Check confidence threshold
+            if signal.confidence < self.config['trading']['min_confidence']:
+                logger.info(
+                    f"Signal for {signal.symbol} below confidence threshold")
+                return False
 
-        # Check maximum positions
-        if len(self.positions) >= self.config['trading']['max_positions']:
-            logger.info("Maximum number of positions reached")
-            return False
+            # Check maximum positions
+            if len(self.positions) >= self.config['trading']['max_positions']:
+                logger.info("Maximum number of positions reached")
+                return False
 
-        # Check if already have position in this symbol
-        if signal.symbol in self.positions:
-            logger.info(f"Already have position in {signal.symbol}")
-            return False
+            # Check if already have position in this symbol
+            if signal.symbol in self.positions:
+                logger.info(f"Already have position in {signal.symbol}")
+                return False
 
-        return True
+            return True
 
     def update_stop_losses(self, current_prices: Dict[str, float]) -> List[str]:
         """Update stop losses and check for exits"""
         symbols_to_exit = []
 
-        for symbol, position in self.positions.items():
-            if symbol in current_prices:
-                current_price = current_prices[symbol]
-                position.current_price = current_price
-                position.unrealized_pnl = (
-                    current_price - position.entry_price) * position.quantity
+        with self._lock:
+            for symbol, position in self.positions.items():
+                if symbol in current_prices:
+                    current_price = current_prices[symbol]
+                    position.current_price = current_price
+                    position.unrealized_pnl = (
+                        current_price - position.entry_price) * position.quantity
 
-                # Check stop loss
-                if position.stop_loss and current_price <= position.stop_loss:
-                    symbols_to_exit.append(symbol)
-                    logger.info(
-                        f"Stop loss triggered for {symbol} at {current_price}")
+                    # Check stop loss
+                    if position.stop_loss and current_price <= position.stop_loss:
+                        symbols_to_exit.append(symbol)
+                        logger.info(
+                            f"Stop loss triggered for {symbol} at {current_price}")
 
-                # Check take profit
-                if position.target_price and current_price >= position.target_price:
-                    symbols_to_exit.append(symbol)
-                    logger.info(
-                        f"Take profit triggered for {symbol} at {current_price}")
+                    # Check take profit
+                    if position.target_price and current_price >= position.target_price:
+                        symbols_to_exit.append(symbol)
+                        logger.info(
+                            f"Take profit triggered for {symbol} at {current_price}")
 
         return symbols_to_exit
 
@@ -553,11 +729,11 @@ class AlertSystem:
             return
 
         try:
-            msg = MimeMultipart()
+            msg = MIMEMultipart()
             msg['From'] = self.config['alerts']['email_user']
             msg['Subject'] = subject
 
-            msg.attach(MimeText(message, 'plain'))
+            msg.attach(MIMEText(message, 'plain'))
 
             server = smtplib.SMTP(
                 self.config['alerts']['email_smtp'],
@@ -607,80 +783,85 @@ class AlertSystem:
 
 
 class DatabaseManager:
-    """Database operations for storing trading data"""
+    """Database operations with proper connection management"""
 
     def __init__(self, db_file: str = 'trading_bot.db'):
         self.db_file = db_file
         self.init_database()
 
+    @contextmanager
+    def _get_connection(self):
+        """Context manager for database connections"""
+        conn = sqlite3.connect(self.db_file)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def init_database(self) -> None:
         """Initialize database tables"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
 
-        # Create signals table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                signal TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                timestamp TEXT NOT NULL,
-                current_price REAL NOT NULL,
-                target_price REAL,
-                stop_loss REAL,
-                reasoning TEXT
-            )
-        ''')
+            # Create signals table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    signal TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    current_price REAL NOT NULL,
+                    target_price REAL,
+                    stop_loss REAL,
+                    reasoning TEXT
+                )
+            ''')
 
-        # Create positions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                quantity REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                entry_date TEXT NOT NULL,
-                exit_price REAL,
-                exit_date TEXT,
-                realized_pnl REAL,
-                status TEXT DEFAULT 'OPEN'
-            )
-        ''')
+            # Create positions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    entry_date TEXT NOT NULL,
+                    exit_price REAL,
+                    exit_date TEXT,
+                    realized_pnl REAL,
+                    status TEXT DEFAULT 'OPEN'
+                )
+            ''')
 
-        conn.commit()
-        conn.close()
+            conn.commit()
 
     def save_signal(self, signal: TradingSignal) -> None:
-        """Save trading signal to database"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            INSERT INTO signals (symbol, signal, confidence, timestamp, current_price, 
-                               target_price, stop_loss, reasoning)
+        """Save trading signal to database with proper connection handling"""
+        query = '''
+            INSERT INTO signals (symbol, signal, confidence, timestamp, 
+                               current_price, target_price, stop_loss, reasoning)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            signal.symbol, signal.signal, signal.confidence,
-            signal.timestamp.isoformat(), signal.current_price,
-            signal.target_price, signal.stop_loss, signal.reasoning
-        ))
+        '''
 
-        conn.commit()
-        conn.close()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, (
+                signal.symbol, signal.signal, signal.confidence,
+                signal.timestamp.isoformat(), signal.current_price,
+                signal.target_price, signal.stop_loss, signal.reasoning
+            ))
+            conn.commit()
 
     def get_recent_signals(self, days: int = 7) -> pd.DataFrame:
-        """Get recent signals from database"""
-        conn = sqlite3.connect(self.db_file)
-
-        query = '''
+        """Get recent signals from database with proper connection handling"""
+        query = f'''
             SELECT * FROM signals 
-            WHERE timestamp >= datetime('now', '-{} days')
+            WHERE timestamp >= datetime('now', '-{days} days')
             ORDER BY timestamp DESC
-        '''.format(days)
+        '''
 
-        df = pd.read_sql_query(query, conn)
-        conn.close()
+        with self._get_connection() as conn:
+            df = pd.read_sql_query(query, conn)
 
         return df
 
@@ -705,24 +886,31 @@ class TradingBot:
         """Initialize the trading bot"""
         logger.info("Initializing Trading Bot...")
 
-        # Load historical data
-        symbols = self.config['data']['symbols']
-        logger.info(f"Loading data for symbols: {symbols}")
+        # Try to load existing model first
+        if self.ml_predictor.load_model():
+            logger.info("Loaded existing model")
+        else:
+            # Load historical data and train new model
+            symbols = self.config['data']['symbols']
+            logger.info(f"Loading data for symbols: {symbols}")
 
-        historical_data = self.data_collector.get_multiple_stocks(
-            symbols, period='2y'
-        )
+            historical_data = self.data_collector.get_multiple_stocks(
+                symbols, period='2y'
+            )
 
-        # Train initial model
-        logger.info("Training initial ML model...")
-        features, targets = self.ml_predictor.prepare_data(historical_data)
-        self.ml_predictor.train_model(features, targets)
+            # Train initial model
+            logger.info("Training initial ML model...")
+            features, targets = self.ml_predictor.prepare_data(historical_data)
+            self.ml_predictor.train_model(features, targets)
+
+            # Save the trained model
+            self.ml_predictor.save_model()
 
         self.last_training_date = datetime.now()
         logger.info("Trading Bot initialized successfully!")
 
     def generate_signals(self) -> List[TradingSignal]:
-        """Generate trading signals for all symbols"""
+        """Generate trading signals with better error handling"""
         signals = []
         symbols = self.config['data']['symbols']
 
@@ -733,6 +921,7 @@ class TradingBot:
 
         for symbol, data in current_data.items():
             if data.empty:
+                logger.warning(f"Empty data for {symbol}, skipping")
                 continue
 
             try:
@@ -802,8 +991,16 @@ class TradingBot:
 
                 signals.append(signal)
 
+            except ValueError as e:
+                logger.error(f"Value error for {symbol}: {str(e)}")
+                continue
+            except KeyError as e:
+                logger.error(f"Missing data field for {symbol}: {str(e)}")
+                continue
             except Exception as e:
-                logger.error(f"Error generating signal for {symbol}: {str(e)}")
+                logger.error(
+                    f"Unexpected error for {symbol}: {str(e)}", exc_info=True)
+                continue
 
         return signals
 
@@ -843,14 +1040,17 @@ class TradingBot:
                         stop_loss=signal.stop_loss,
                         target_price=signal.target_price
                     )
-                    self.risk_manager.positions[signal.symbol] = position
+                    with self.risk_manager._lock:
+                        self.risk_manager.positions[signal.symbol] = position
 
     def update_positions(self) -> None:
         """Update existing positions"""
         if not self.risk_manager.positions:
             return
 
-        symbols = list(self.risk_manager.positions.keys())
+        with self.risk_manager._lock:
+            symbols = list(self.risk_manager.positions.keys())
+
         current_data = self.data_collector.get_multiple_stocks(
             symbols, period='1d')
 
@@ -863,20 +1063,22 @@ class TradingBot:
         symbols_to_exit = self.risk_manager.update_stop_losses(current_prices)
 
         for symbol in symbols_to_exit:
-            position = self.risk_manager.positions[symbol]
-            realized_pnl = (position.current_price -
-                            position.entry_price) * position.quantity
+            with self.risk_manager._lock:
+                if symbol in self.risk_manager.positions:
+                    position = self.risk_manager.positions[symbol]
+                    realized_pnl = (position.current_price -
+                                    position.entry_price) * position.quantity
 
-            logger.info(
-                f"POSITION CLOSED: {symbol} - P&L: ${realized_pnl:.2f}")
+                    logger.info(
+                        f"POSITION CLOSED: {symbol} - P&L: ${realized_pnl:.2f}")
 
-            # Send exit alert
-            exit_message = f"Position closed for {symbol}: P&L ${realized_pnl:.2f}"
-            self.alert_system.send_email_alert(
-                f"Position Closed: {symbol}", exit_message)
+                    # Send exit alert
+                    exit_message = f"Position closed for {symbol}: P&L ${realized_pnl:.2f}"
+                    self.alert_system.send_email_alert(
+                        f"Position Closed: {symbol}", exit_message)
 
-            # Remove from positions
-            del self.risk_manager.positions[symbol]
+                    # Remove from positions
+                    del self.risk_manager.positions[symbol]
 
     def retrain_model(self) -> None:
         """Retrain the ML model with new data"""
@@ -892,6 +1094,9 @@ class TradingBot:
 
         features, targets = self.ml_predictor.prepare_data(historical_data)
         self.ml_predictor.train_model(features, targets)
+
+        # Save the retrained model
+        self.ml_predictor.save_model()
 
         self.last_training_date = datetime.now()
         logger.info("Model retrained successfully")
@@ -918,9 +1123,11 @@ class TradingBot:
                 logger.info("No signals generated this cycle")
 
             # Log portfolio status
-            total_positions = len(self.risk_manager.positions)
-            total_unrealized_pnl = sum(
-                pos.unrealized_pnl for pos in self.risk_manager.positions.values())
+            with self.risk_manager._lock:
+                total_positions = len(self.risk_manager.positions)
+                total_unrealized_pnl = sum(
+                    pos.unrealized_pnl for pos in self.risk_manager.positions.values()
+                )
 
             logger.info(
                 f"Portfolio Status: {total_positions} positions, Unrealized P&L: ${total_unrealized_pnl:.2f}")
@@ -965,9 +1172,11 @@ class TradingBot:
         avg_confidence = recent_signals['confidence'].mean()
 
         # Position statistics
-        positions = self.risk_manager.positions
-        total_unrealized_pnl = sum(
-            pos.unrealized_pnl for pos in positions.values())
+        with self.risk_manager._lock:
+            positions = self.risk_manager.positions
+            total_unrealized_pnl = sum(
+                pos.unrealized_pnl for pos in positions.values()
+            )
 
         return {
             "recent_signals": len(recent_signals),
@@ -988,7 +1197,7 @@ class BacktestEngine:
         self.commission = 0.001  # 0.1% commission
 
     def run_backtest(self, start_date: str, end_date: str, symbols: List[str]) -> Dict[str, Any]:
-        """Run backtest over specified period"""
+        """Run backtest over specified period with configuration usage"""
         logger.info(f"Running backtest from {start_date} to {end_date}")
 
         # Initialize components
@@ -1085,8 +1294,10 @@ class BacktestEngine:
                 # Process signals
                 for signal in signals:
                     if signal.signal == 'BUY' and signal.symbol not in positions:
-                        # Buy signal
-                        position_value = portfolio_value * 0.1  # 10% position size
+                        # Buy signal - use configuration for position size
+                        position_size_pct = self.config['trading'].get(
+                            'max_position_size', 0.1)
+                        position_value = portfolio_value * position_size_pct
                         shares = position_value / signal.current_price
                         cost = shares * signal.current_price * \
                             (1 + self.commission)
@@ -1164,7 +1375,8 @@ class BacktestEngine:
         # Calculate Sharpe ratio
         returns = df_values['portfolio_value'].pct_change().dropna()
         if len(returns) > 0:
-            sharpe_ratio = np.sqrt(252) * returns.mean() / returns.std()
+            sharpe_ratio = np.sqrt(252) * returns.mean() / \
+                returns.std() if returns.std() > 0 else 0
             max_drawdown = (df_values['portfolio_value'] /
                             df_values['portfolio_value'].cummax() - 1).min()
         else:
@@ -1204,9 +1416,9 @@ def create_default_config():
             'email_enabled': False,
             'email_smtp': 'smtp.gmail.com',
             'email_port': 587,
-            'email_user': 'your_email@gmail.com',
-            'email_password': 'your_app_password',
-            'email_recipients': ['your_email@gmail.com']
+            'email_user': '',
+            'email_password': '',
+            'email_recipients': []
         },
         'ml': {
             'model_type': 'random_forest',
