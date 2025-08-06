@@ -29,7 +29,7 @@ alerts:
   email_enabled: false          # Enable/disable email alerts
   email_smtp: smtp.gmail.com    # SMTP server
   email_port: 587               # SMTP port
-  email_user: ""                # Your email address
+  email_user: "carlosortega77@gmail.com"                # Your email address
   email_password: ""            # App password (not your regular password)
   email_recipients:             # List of email addresses to receive alerts
     - "carlosortega77@gmail.com"
